@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -114,6 +115,7 @@ class SnmpEngine:
         maxMessageSize: int = 65507,
         msgAndPduDsp: Any = None,
         enableLegacyVersions: bool | None = None,
+        clock: Callable[[], float | int] | None = None,
     ) -> None:
         """Assemble the subsystems, and settle which SNMP versions this engine speaks.
 
@@ -155,7 +157,7 @@ class SnmpEngine:
             SnmpV3MessageProcessingModel.messageProcessingModelID: SnmpV3MessageProcessingModel(),
         }
         self.securityModels: dict[Any, Any] = {
-            SnmpUSMSecurityModel.securityModelID: SnmpUSMSecurityModel(),
+            SnmpUSMSecurityModel.securityModelID: SnmpUSMSecurityModel(clock=clock),
         }
 
         if self.enableLegacyVersions:
@@ -260,6 +262,27 @@ class SnmpEngine:
     def __repr__(self) -> str:
         """The class and this engine's ID, which is what distinguishes one from another."""
         return f"{self.__class__.__name__}(snmpEngineID={self.snmpEngineID!r})"
+
+    def export_remote_clocks(self):
+        """Return a key-free snapshot of authenticated remote USM clocks and peers."""
+        mp_model = self.messageProcessingSubsystems[3]
+        sm_model = self.securityModels[3]
+        clocks = sm_model.exportRemoteClockState()
+        peers = mp_model.exportRemoteEngineInfo(clocks)
+        return {"clocks": clocks, "peers": peers}
+
+    def import_remote_clocks(self, snapshot):
+        """Import validated remote clock estimates and authenticated peer mappings."""
+        if not isinstance(snapshot, dict) or set(snapshot) != {"clocks", "peers"}:
+            raise ValueError("remote clock snapshot must contain clocks and peers")
+        clock_result = self.securityModels[3].importRemoteClockState(
+            snapshot["clocks"]
+        )
+        now = self.securityModels[3].currentRemoteTime()
+        peer_result = self.messageProcessingSubsystems[3].importRemoteEngineInfo(
+            snapshot["peers"], now, set(clock_result["entries"])
+        )
+        return {"clocks": clock_result, "peers": peer_result}
 
     # Transport dispatcher bindings
 

@@ -9,7 +9,6 @@ Discovery, the time window that makes a replay stale, and the counters a peer
 reads to detect one, all live here.
 """
 
-import time
 from collections.abc import Callable
 from typing import Any, NoReturn, TypeVar
 
@@ -19,7 +18,7 @@ from pyasn1.type import constraint, namedtype, univ
 
 from pysnmp import debug
 from pysnmp.entity.observer import execution_context
-from pysnmp.proto import api, errind, error, rfc3411
+from pysnmp.proto import api, errind, error, rfc3411, usmclock
 from pysnmp.proto.secmod.base import AbstractSecurityModel
 from pysnmp.proto.secmod.rfc3414.auth import hmacmd5, hmacsha, noauth
 from pysnmp.proto.secmod.rfc3414.priv import des, nopriv
@@ -126,7 +125,7 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
     # SNMP engine
     wildcardSecurityEngineId = pMod.OctetString(hexValue="0000000000")
 
-    def __init__(self):
+    def __init__(self, clock: Callable[[], float | int] | None = None):
         """Adds the timeline USM needs to detect a replayed message.
 
         :RFC:`3414#section-2.2.3` requires the engine boots and time of every remote
@@ -138,8 +137,53 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
         self.__securityParametersSpec = UsmSecurityParameters()
         self.__timeline = {}
         self.__timelineExpQueue = {}
+        self.__authenticatedEngineIds = set()
         self.__expirationTimer = 0
         self.__paramsBranchId = -1
+        self.__clock = clock
+
+    def __currentTime(self):
+        return usmclock.current_time(self.__clock)
+
+    def currentRemoteTime(self):
+        """Current clock value used by remote clock import and expiration checks."""
+        return self.__currentTime()
+
+    def __scheduleTimelineExpiration(self, snmpEngine, securityEngineID):
+        timerResolution = (
+            snmpEngine.transportDispatcher is None
+            and 1.0
+            or snmpEngine.transportDispatcher.getTimerResolution()
+        )
+        expireAt = int(self.__expirationTimer + 300 / timerResolution)
+        self.__timelineExpQueue.setdefault(expireAt, []).append(securityEngineID)
+
+    def __storeAuthenticatedTimeline(
+        self, snmpEngine, securityEngineID, engineBoots, engineTime, timestamp=None
+    ):
+        now = self.__currentTime() if timestamp is None else int(timestamp)
+        self.__timeline[securityEngineID] = (
+            engineBoots,
+            engineTime,
+            engineTime,
+            now,
+        )
+        self.__authenticatedEngineIds.add(securityEngineID)
+        self.__scheduleTimelineExpiration(snmpEngine, securityEngineID)
+
+    def __forgetTimeline(self, securityEngineID):
+        self.__timeline.pop(securityEngineID, None)
+        self.__authenticatedEngineIds.discard(securityEngineID)
+
+    def __invalidatePeer(
+        self, snmpEngine, securityEngineID, messageProcessingModel=3
+    ):
+        self.__forgetTimeline(securityEngineID)
+        mpHandler = snmpEngine.messageProcessingSubsystems.get(
+            int(messageProcessingModel)
+        )
+        if mpHandler is not None and hasattr(mpHandler, "forgetSecurityEngineId"):
+            mpHandler.forgetSecurityEngineId(securityEngineID)
 
     def __sec2usr(self, snmpEngine, securityName, securityEngineID=None):
         mibBuilder = snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder
@@ -625,6 +669,16 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                     latestReceivedEngineTime,
                     latestUpdateTimestamp,
                 ) = self.__timeline[securityEngineID]
+                elapsedTime = self.__currentTime() - int(latestUpdateTimestamp)
+
+                if elapsedTime < 0:
+                    self.__forgetTimeline(securityEngineID)
+                    snmpEngineBoots = snmpEngineTime = 0
+                else:
+                    snmpEngineTime = min(
+                        usmclock.MAX_ENGINE_BOOTS,
+                        int(snmpEngineTime) + elapsedTime,
+                    )
 
                 debug.logger & debug.flagSM and debug.logger(
                     "__generateRequestOrResponseMsg: read snmpEngineBoots, snmpEngineTime from timeline"
@@ -1183,30 +1237,11 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                 "processIncomingMsg: incoming msg authenticated"
             )
 
-            # synchronize time with authed peer
-            self.__timeline[msgAuthoritativeEngineId] = (
-                securityParameters.getComponentByPosition(1),
-                securityParameters.getComponentByPosition(2),
-                securityParameters.getComponentByPosition(2),
-                int(time.time()),
-            )
-
-            timerResolution = (
-                snmpEngine.transportDispatcher is None
-                and 1.0
-                or snmpEngine.transportDispatcher.getTimerResolution()
-            )
-            expireAt = int(self.__expirationTimer + 300 / timerResolution)
-            if expireAt not in self.__timelineExpQueue:
-                self.__timelineExpQueue[expireAt] = []
-            self.__timelineExpQueue[expireAt].append(msgAuthoritativeEngineId)
-
-            debug.logger & debug.flagSM and debug.logger(
-                f"processIncomingMsg: store timeline for securityEngineID {msgAuthoritativeEngineId!r}"
-            )
+            self.__authenticatedEngineIds.add(msgAuthoritativeEngineId)
 
         # 3.2.7
         if securityLevel in (2, 3):
+            timelineKnown = False
             if msgAuthoritativeEngineId == snmpEngineID:
                 # Authoritative SNMP engine: use local notion (SF bug #1649032)
                 (snmpEngineBoots, snmpEngineTime) = mibBuilder.importSymbols(
@@ -1227,12 +1262,28 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                     latestUpdateTimestamp,
                 ) = self.__timeline[msgAuthoritativeEngineId]
                 # time passed since last talk with this SNMP engine
-                idleTime = int(time.time()) - latestUpdateTimestamp
+                idleTime = self.__currentTime() - int(latestUpdateTimestamp)
+                timelineKnown = True
                 debug.logger & debug.flagSM and debug.logger(
                     f"processIncomingMsg: read timeline snmpEngineBoots {snmpEngineBoots} snmpEngineTime {snmpEngineTime} for msgAuthoritativeEngineId {msgAuthoritativeEngineId!r}, idle time {idleTime} secs"
                 )
+                if idleTime < 0:
+                    self.__invalidatePeer(
+                        snmpEngine,
+                        msgAuthoritativeEngineId,
+                        messageProcessingModel,
+                    )
+                    raise error.StatusInformation(
+                        errorIndication=errind.notInTimeWindow,
+                        msgUserName=msgUserName,
+                    )
             else:
-                raise error.ProtocolError("Peer SNMP engine info missing")
+                snmpEngineBoots = 0
+                snmpEngineTime = 0
+                latestReceivedEngineTime = -1
+                latestUpdateTimestamp = self.__currentTime()
+                idleTime = 0
+                timelineKnown = False
 
             # 3.2.7a
             if msgAuthoritativeEngineId == snmpEngineID:
@@ -1264,41 +1315,58 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                 # 3.2.7b.1
                 # noinspection PyUnboundLocalVariable
                 if (
-                    msgAuthoritativeEngineBoots > snmpEngineBoots
-                    or msgAuthoritativeEngineBoots == snmpEngineBoots
-                    and msgAuthoritativeEngineTime > latestReceivedEngineTime
+                    not timelineKnown
+                    or (
+                        msgAuthoritativeEngineBoots > snmpEngineBoots
+                        and msgAuthoritativeEngineBoots < usmclock.MAX_ENGINE_BOOTS
+                    )
+                    or (
+                        msgAuthoritativeEngineBoots == snmpEngineBoots
+                        and msgAuthoritativeEngineTime > latestReceivedEngineTime
+                        and abs(
+                            idleTime
+                            + int(snmpEngineTime)
+                            - int(msgAuthoritativeEngineTime)
+                        )
+                        <= usmclock.TIME_WINDOW
+                    )
                 ):
-                    self.__timeline[msgAuthoritativeEngineId] = (
+                    self.__storeAuthenticatedTimeline(
+                        snmpEngine,
+                        msgAuthoritativeEngineId,
                         msgAuthoritativeEngineBoots,
                         msgAuthoritativeEngineTime,
-                        msgAuthoritativeEngineTime,
-                        int(time.time()),
                     )
-
-                    timerResolution = (
-                        snmpEngine.transportDispatcher is None
-                        and 1.0
-                        or snmpEngine.transportDispatcher.getTimerResolution()
-                    )
-                    expireAt = int(self.__expirationTimer + 300 / timerResolution)
-                    if expireAt not in self.__timelineExpQueue:
-                        self.__timelineExpQueue[expireAt] = []
-                    self.__timelineExpQueue[expireAt].append(msgAuthoritativeEngineId)
 
                     debug.logger & debug.flagSM and debug.logger(
                         f"processIncomingMsg: stored timeline msgAuthoritativeEngineBoots {msgAuthoritativeEngineBoots} msgAuthoritativeEngineTime {msgAuthoritativeEngineTime} for msgAuthoritativeEngineId {msgAuthoritativeEngineId!r}"
                     )
 
-                # 3.2.7b.2
-                if (
-                    snmpEngineBoots == 2147483647
-                    or msgAuthoritativeEngineBoots < snmpEngineBoots
-                    or msgAuthoritativeEngineBoots == snmpEngineBoots
-                    and abs(
-                        idleTime + int(snmpEngineTime) - int(msgAuthoritativeEngineTime)
+            # 3.2.7b.2
+            if msgAuthoritativeEngineBoots == usmclock.MAX_ENGINE_BOOTS or (
+                timelineKnown
+                and (
+                    msgAuthoritativeEngineBoots < snmpEngineBoots
+                    or (
+                        msgAuthoritativeEngineBoots == snmpEngineBoots
+                        and abs(
+                            idleTime
+                            + int(snmpEngineTime)
+                            - int(msgAuthoritativeEngineTime)
+                        )
+                        > usmclock.TIME_WINDOW
                     )
-                    > 150
+                )
                 ):
+                    if (
+                        msgAuthoritativeEngineBoots < snmpEngineBoots
+                        or idleTime < 0
+                    ):
+                        self.__invalidatePeer(
+                            snmpEngine,
+                            msgAuthoritativeEngineId,
+                            messageProcessingModel,
+                        )
                     raise error.StatusInformation(
                         errorIndication=errind.notInTimeWindow, msgUserName=msgUserName
                     )
@@ -1418,11 +1486,73 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
             for engineIdKey in self.__timelineExpQueue[self.__expirationTimer]:
                 if engineIdKey in self.__timeline:
                     del self.__timeline[engineIdKey]
+                    self.__authenticatedEngineIds.discard(engineIdKey)
                     debug.logger & debug.flagSM and debug.logger(
                         f"__expireTimelineInfo: expiring {engineIdKey!r}"
                     )
             del self.__timelineExpQueue[self.__expirationTimer]
         self.__expirationTimer += 1
+
+    def exportRemoteClockState(self):
+        """Return authenticated, key-free remote clock state for application storage."""
+        now = self.__currentTime()
+        entries = []
+        for engineID in self.__authenticatedEngineIds:
+            if engineID not in self.__timeline:
+                continue
+            boots, engineTime, latestEngineTime, savedAt = self.__timeline[engineID]
+            candidate = {
+                "securityEngineId": engineID,
+                "engineBoots": int(boots),
+                "engineTime": int(engineTime),
+                "latestReceivedEngineTime": int(latestEngineTime),
+                "savedAt": int(savedAt),
+            }
+            if usmclock.is_fresh_clock(candidate, now):
+                entries.append(
+                    {
+                        **candidate,
+                        "securityEngineId": usmclock.serialize_octets(engineID),
+                    }
+                )
+        return usmclock.make_snapshot(entries)
+
+    def importRemoteClockState(self, snapshot):
+        """Load validated clock estimates without weakening incoming USM checks."""
+        raw_entries = usmclock.validate_snapshot(snapshot)
+        now = self.__currentTime()
+        imported = 0
+        rejected = 0
+        importedIds = []
+
+        for raw_entry in raw_entries:
+            try:
+                entry = usmclock.normalize_clock_fields(raw_entry)
+            except ValueError:
+                rejected += 1
+                continue
+            engineID = univ.OctetString(entry["securityEngineId"])
+            existing = self.__timeline.get(engineID)
+            if not usmclock.is_fresh_clock(
+                entry, now
+            ) or not usmclock.is_continuous_clock(entry, existing):
+                rejected += 1
+                continue
+
+            self.__timeline[engineID] = (
+                entry["engineBoots"],
+                entry["engineTime"],
+                entry["latestReceivedEngineTime"],
+                entry["savedAt"],
+            )
+            self.__authenticatedEngineIds.add(engineID)
+            timerResolution = 1.0
+            expireAt = int(self.__expirationTimer + 300 / timerResolution)
+            self.__timelineExpQueue.setdefault(expireAt, []).append(engineID)
+            imported += 1
+            importedIds.append(usmclock.serialize_octets(engineID))
+
+        return {"imported": imported, "rejected": rejected, "entries": importedIds}
 
     def receiveTimerTick(self, snmpEngine, timeNow):
         """Expire what is remembered about peer engines' clocks."""

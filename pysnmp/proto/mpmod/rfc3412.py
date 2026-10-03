@@ -13,7 +13,7 @@ from pyasn1.type import constraint, namedtype, univ
 
 from pysnmp import debug
 from pysnmp.entity.observer import execution_context
-from pysnmp.proto import api, errind, error, rfc1905, rfc3411
+from pysnmp.proto import api, errind, error, rfc1905, rfc3411, usmclock
 from pysnmp.proto.mpmod.base import AbstractMessageProcessingModel
 
 # API to rfc1905 protocol objects
@@ -262,6 +262,77 @@ class SnmpV3MessageProcessingModel(AbstractMessageProcessingModel):
             )
         else:
             return None, None, None
+
+    def forgetSecurityEngineId(self, securityEngineId):
+        """Drop address mappings pointing at a USM engine that must rediscover."""
+        staleKeys = [
+            key
+            for key, data in self.__engineIdCache.items()
+            if data["securityEngineId"] == securityEngineId
+        ]
+        for key in staleKeys:
+            del self.__engineIdCache[key]
+
+    def exportRemoteEngineInfo(self, clockSnapshot):
+        """Export authenticated address mappings joined to fresh clock entries."""
+        clock_entries = usmclock.validate_snapshot(clockSnapshot)
+        saved_at = {}
+        for raw_entry in clock_entries:
+            clock_entry = usmclock.normalize_clock_fields(raw_entry)
+            saved_at[clock_entry["securityEngineId"]] = clock_entry["savedAt"]
+        entries = []
+        for (transportDomain, transportAddress), data in self.__engineIdCache.items():
+            engine_id = bytes(data["securityEngineId"])
+            if not data.get("trusted") or engine_id not in saved_at:
+                continue
+            entries.append(
+                {
+                    "securityEngineId": usmclock.serialize_octets(engine_id),
+                    "savedAt": saved_at[engine_id],
+                    "transport": usmclock.serialize_transport(
+                        transportDomain,
+                        transportAddress,
+                        data["contextEngineId"],
+                        data["contextName"],
+                    ),
+                }
+            )
+        return usmclock.make_snapshot(entries)
+
+    def importRemoteEngineInfo(self, snapshot, now, clockEngineIds=None):
+        """Import validated authenticated mappings without accepting keys."""
+        raw_entries = usmclock.validate_snapshot(snapshot)
+        imported = 0
+        rejected = 0
+
+        for raw_entry in raw_entries:
+            try:
+                entry = usmclock.normalize_engine_fields(raw_entry)
+                if not usmclock.is_fresh_clock(entry, now):
+                    rejected += 1
+                    continue
+                engine_hex = usmclock.serialize_octets(entry["securityEngineId"])
+                if clockEngineIds is not None and engine_hex not in clockEngineIds:
+                    rejected += 1
+                    continue
+            except ValueError:
+                rejected += 1
+                continue
+
+            engine_id = univ.OctetString(entry["securityEngineId"])
+            transport = entry["transport"]
+            key = transport["domain"], transport["address"]
+            self.__engineIdCache[key] = {
+                "securityEngineId": engine_id,
+                "contextEngineId": univ.OctetString(transport["contextEngineId"]),
+                "contextName": univ.OctetString(transport["contextName"]),
+                "trusted": True,
+            }
+            expireAt = int(self.__expirationTimer + 300 / 1.0)
+            self.__engineIdCacheExpQueue.setdefault(expireAt, []).append(key)
+            imported += 1
+
+        return {"imported": imported, "rejected": rejected}
 
     # 7.1.1a
     def prepareOutgoingMessage(
@@ -774,6 +845,8 @@ class SnmpV3MessageProcessingModel(AbstractMessageProcessingModel):
         else:
             # Sniff for engineIdCache
             k = (transportDomain, transportAddress)
+            if securityLevel in (2, 3) and k in self.__engineIdCache:
+                self.__engineIdCache[k]["trusted"] = True
             if k not in self.__engineIdCache:
                 contextEngineId = scopedPDU[0]
                 contextName = scopedPDU[1]
@@ -786,6 +859,7 @@ class SnmpV3MessageProcessingModel(AbstractMessageProcessingModel):
                         "securityEngineId": securityEngineId,
                         "contextEngineId": contextEngineId,
                         "contextName": contextName,
+                        "trusted": False,
                     }
 
                     expireAt = int(
