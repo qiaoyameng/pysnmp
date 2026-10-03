@@ -3,6 +3,7 @@
 import pytest
 from pyasn1.type import univ
 
+import pysnmp.smi.error
 from pysnmp.entity import config
 from pysnmp.proto import errind, error
 from pysnmp.proto.acmod.rfc3415 import Vacm
@@ -1018,6 +1019,338 @@ class TestRfc3415Vacm:
         assert viewName == "writeView"
         viewName = vacm._getFamilyViewName("group1", "", 3, 1, "notify")
         assert viewName == "notifyView"
+
+
+class TestRfc3415VacmSnapshots:
+    @staticmethod
+    def _configure_snapshot_view(engine):
+        config.addContext(engine, "")
+        config.addVacmGroup(engine, "snapshot", 3, "snapshot-user")
+        config.addVacmAccess(
+            engine,
+            "snapshot",
+            "",
+            3,
+            1,
+            "exact",
+            "snapshot-view",
+            None,
+            None,
+        )
+
+        wild_family = (1, 3, 6, 1, 4, 99, 1, 2)
+        config.addVacmView(
+            engine,
+            "snapshot-view",
+            "included",
+            (1, 3, 6, 1, 2, 1, 1),
+            "",
+        )
+        config.addVacmView(
+            engine,
+            "snapshot-view",
+            "included",
+            wild_family,
+            (1, 1, 0, 1, 1, 1, 0, 1),
+        )
+        config.addVacmView(
+            engine,
+            "snapshot-view",
+            "excluded",
+            wild_family + (5,),
+            "",
+        )
+        config.addVacmView(
+            engine,
+            "snapshot-view",
+            "included",
+            wild_family + (5, 7),
+            "",
+        )
+
+    @staticmethod
+    def _decision(func, oid):
+        try:
+            func(oid)
+        except error.StatusInformation as exc:
+            return exc["errorIndication"]
+        return errind.accessAllowed
+
+    def test_snapshot_matches_single_oid_decisions_with_masked_family(self):
+        from pysnmp.entity.engine import SnmpEngine
+        from pysnmp.proto.rfc1902 import OctetString
+
+        engine = SnmpEngine()
+        self._configure_snapshot_view(engine)
+        vacm = engine.accessControlModel[3]
+        mib_builder = engine.msgAndPduDsp.mibInstrumController.mibBuilder
+
+        variable_names = (
+            (1, 3, 6, 1, 2, 1, 1, 1, 0),
+            (1, 3, 6, 1, 6, 3, 15, 1, 1, 0),
+            (1, 3, 6, 1, 4, 99),
+            (1, 3, 6, 1, 4, 99, 1, 2),
+            (1, 3, 6, 1, 4, 99, 9, 2, 9),
+            (1, 3, 6, 1, 4, 99, 1, 2, 0),
+            (1, 3, 6, 1, 4, 99, 1, 2, 4),
+            (1, 3, 6, 1, 4, 99, 1, 2, 5),
+            (1, 3, 6, 1, 4, 99, 1, 2, 5, 0),
+            (1, 3, 6, 1, 4, 99, 1, 2, 5, 7),
+            (1, 3, 6, 1, 4, 99, 1, 2, 5, 7, 9),
+            (1, 3, 6, 1, 4, 99, 1, 2, 5, 8),
+            (1, 3, 6, 2, 4, 99, 1, 2, 9),
+        )
+
+        snapshot = vacm.createAccessSnapshot(
+            engine, 3, OctetString("snapshot-user"), 1, "read", OctetString("")
+        )
+
+        expected = [
+            self._decision(
+                lambda oid, engine=engine: vacm.isAccessAllowed(
+                    engine,
+                    3,
+                    OctetString("snapshot-user"),
+                    1,
+                    "read",
+                    OctetString(""),
+                    oid,
+                ),
+                oid,
+            )
+            for oid in variable_names
+        ]
+        actual = [
+            self._decision(snapshot.isAccessAllowed, oid) for oid in variable_names
+        ]
+
+        assert actual == expected
+        assert actual.count(errind.accessAllowed) == 8
+        assert actual.count(errind.notInView) == 5
+
+        original_import = mib_builder.importSymbols
+        reads = 0
+
+        def counting_import(*args, **kwargs):
+            nonlocal reads
+            reads += 1
+            return original_import(*args, **kwargs)
+
+        mib_builder.importSymbols = counting_import
+        try:
+            for oid in variable_names:
+                self._decision(snapshot.isAccessAllowed, oid)
+            snapshot_reads = reads
+
+            reads = 0
+            for oid in variable_names:
+                self._decision(
+                    lambda oid, engine=engine: vacm.isAccessAllowed(
+                        engine,
+                        3,
+                        OctetString("snapshot-user"),
+                        1,
+                        "read",
+                        OctetString(""),
+                        oid,
+                    ),
+                    oid,
+                )
+            single_reads = reads
+        finally:
+            mib_builder.importSymbols = original_import
+
+        assert snapshot_reads == 0
+        assert single_reads == len(variable_names) * 4
+
+    def test_snapshot_preserves_error_distinctions(self):
+        from pysnmp.entity.engine import SnmpEngine
+        from pysnmp.proto.rfc1902 import OctetString
+
+        engine = SnmpEngine()
+        self._configure_snapshot_view(engine)
+        vacm = engine.accessControlModel[3]
+
+        with pytest.raises(error.StatusInformation) as exc:
+            vacm.createAccessSnapshot(
+                engine,
+                3,
+                OctetString("snapshot-user"),
+                1,
+                "read",
+                OctetString("missing-context"),
+            )
+        assert exc.value["errorIndication"] is errind.noSuchContext
+
+        with pytest.raises(error.StatusInformation) as exc:
+            vacm.createAccessSnapshot(
+                engine, 3, OctetString("other-user"), 1, "read", OctetString("")
+            )
+        assert exc.value["errorIndication"] is errind.noGroupName
+
+        snapshot = vacm.createAccessSnapshot(
+            engine, 3, OctetString("snapshot-user"), 1, "read", OctetString("")
+        )
+        with pytest.raises(error.StatusInformation) as exc:
+            snapshot.isAccessAllowed((1, 3, 6, 2))
+        assert exc.value["errorIndication"] is errind.notInView
+
+    def test_snapshot_uses_original_subtree_for_equal_length_tie_break(self):
+        from pysnmp.entity.engine import SnmpEngine
+        from pysnmp.proto.rfc1902 import OctetString
+
+        engine = SnmpEngine()
+        config.addContext(engine, "")
+        config.addVacmGroup(engine, "tie", 3, "tie-user")
+        config.addVacmAccess(
+            engine, "tie", "", 3, 1, "exact", "tie-view", None, None
+        )
+
+        family = (1, 3, 6, 1, 4, 99)
+        config.addVacmView(
+            engine,
+            "tie-view",
+            "included",
+            family + (1,),
+            b"\xfe",
+        )
+        config.addVacmView(
+            engine,
+            "tie-view",
+            "excluded",
+            family + (2,),
+            b"\xfe",
+        )
+
+        vacm = engine.accessControlModel[3]
+        snapshot = vacm.createAccessSnapshot(
+            engine, 3, OctetString("tie-user"), 1, "read", OctetString("")
+        )
+        allowed_oid = family + (1,)
+        denied_oid = family + (2,)
+
+        snapshot.isAccessAllowed(allowed_oid)
+        vacm.isAccessAllowed(
+            engine,
+            3,
+            OctetString("tie-user"),
+            1,
+            "read",
+            OctetString(""),
+            allowed_oid,
+        )
+
+        with pytest.raises(error.StatusInformation) as exc:
+            snapshot.isAccessAllowed(denied_oid)
+        assert exc.value["errorIndication"] is errind.notInView
+
+        with pytest.raises(error.StatusInformation) as exc:
+            vacm.isAccessAllowed(
+                engine,
+                3,
+                OctetString("tie-user"),
+                1,
+                "read",
+                OctetString(""),
+                denied_oid,
+            )
+        assert exc.value["errorIndication"] is errind.notInView
+
+    def test_bulk_access_control_compiles_snapshot_once(self):
+        from pysnmp.entity.engine import SnmpEngine
+        from pysnmp.entity.observer import execution_context
+        from pysnmp.entity.rfc3413 import cmdrsp
+        from pysnmp.proto.rfc1902 import OctetString
+        from pysnmp.proto.rfc1905 import GetBulkRequestPDU
+
+        engine = SnmpEngine()
+        self._configure_snapshot_view(engine)
+        vacm = engine.accessControlModel[3]
+        responder = cmdrsp.BulkCommandResponder.__new__(cmdrsp.BulkCommandResponder)
+        created_snapshots = []
+
+        class RecordingSnapshot:
+            def __init__(self):
+                self.calls = 0
+
+            def isAccessAllowed(self, name):
+                self.calls += 1
+
+        def create_snapshot(*args, **kwargs):
+            snapshot = RecordingSnapshot()
+            created_snapshots.append(snapshot)
+            return snapshot
+
+        vacm.createAccessSnapshot = create_snapshot
+        access_control = cmdrsp.BulkAccessControl(responder, engine)
+        execution = {
+            "securityModel": 3,
+            "securityName": OctetString("snapshot-user"),
+            "securityLevel": 1,
+            "contextName": OctetString(""),
+            "pdu": type("PDU", (), {"tagSet": GetBulkRequestPDU.tagSet})(),
+        }
+
+        with execution_context(
+            engine, "rfc3412.receiveMessage:request", execution
+        ):
+            access_control((1, 3, 6, 1, 4, 99, 1, 2), None, 0, "read", engine)
+            access_control((1, 3, 6, 1, 4, 99, 9, 2), None, 1, "read", engine)
+
+        assert len(created_snapshots) == 1
+        assert created_snapshots[0].calls == 2
+
+        missing_group_engine = SnmpEngine()
+        missing_group_access = cmdrsp.BulkAccessControl(
+            responder, missing_group_engine
+        )
+
+        def reject_snapshot(*args, **kwargs):
+            raise error.StatusInformation(errorIndication=errind.noGroupName)
+
+        missing_group_engine.accessControlModel[3].createAccessSnapshot = (
+            reject_snapshot
+        )
+        with execution_context(
+            missing_group_engine,
+            "rfc3412.receiveMessage:request",
+            execution,
+        ):
+            with pytest.raises(pysnmp.smi.error.AuthorizationError):
+                missing_group_access(
+                    (1, 3, 6), None, 0, "read", missing_group_engine
+                )
+
+    def test_snapshot_remains_fixed_after_configuration_changes(self):
+        from pysnmp.entity.engine import SnmpEngine
+        from pysnmp.proto.rfc1902 import OctetString
+
+        engine = SnmpEngine()
+        self._configure_snapshot_view(engine)
+        vacm = engine.accessControlModel[3]
+        old_snapshot = vacm.createAccessSnapshot(
+            engine, 3, OctetString("snapshot-user"), 1, "read", OctetString("")
+        )
+
+        config.addVacmView(
+            engine,
+            "snapshot-view",
+            "excluded",
+            (1, 3, 6, 1, 2, 1, 1),
+            "",
+        )
+        new_snapshot = vacm.createAccessSnapshot(
+            engine, 3, OctetString("snapshot-user"), 1, "read", OctetString("")
+        )
+        oid = (1, 3, 6, 1, 2, 1, 1, 1, 0)
+
+        old_snapshot.isAccessAllowed(oid)
+        with pytest.raises(error.StatusInformation) as exc:
+            new_snapshot.isAccessAllowed(oid)
+        assert exc.value["errorIndication"] is errind.notInView
+
+        with pytest.raises(AttributeError):
+            old_snapshot._entries = ()
 
 
 class TestVacmSecurityExclusions:

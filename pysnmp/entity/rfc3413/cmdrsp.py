@@ -225,7 +225,7 @@ class CommandResponderBase:
                 stateReference,
                 contextName,
                 PDU,
-                (self.__verifyAccess, snmpEngine),
+                (self._verifyAccess, snmpEngine),
             )
 
         except Exception as exc:  # noqa: BLE001 - a request that answered with nothing leaves the manager to time out, so every failure is mapped to an error status
@@ -362,7 +362,9 @@ class CommandResponderBase:
 
         self.releaseStateInformation(stateReference)
 
-    def __verifyAccess(self, name, syntax, idx, viewType, acCtx):
+    def _verifyAccess(
+        self, name, syntax, idx, viewType, acCtx, accessControl=None
+    ):
         """Check one binding against the access control model, as an SMI error.
 
         The credentials come from the observer's record of the message rather than
@@ -382,15 +384,18 @@ class CommandResponderBase:
             execCtx["pdu"].tagSet,
         )
         try:
-            snmpEngine.accessControlModel[self.acmID].isAccessAllowed(
-                snmpEngine,
-                securityModel,
-                securityName,
-                securityLevel,
-                viewType,
-                contextName,
-                name,
-            )
+            if accessControl is None:
+                snmpEngine.accessControlModel[self.acmID].isAccessAllowed(
+                    snmpEngine,
+                    securityModel,
+                    securityName,
+                    securityLevel,
+                    viewType,
+                    contextName,
+                    name,
+                )
+            else:
+                accessControl(name)
         # Map ACM errors onto SMI ones
         except error.StatusInformation as statusInformation:
             debug.logger & debug.flagApp and debug.logger(
@@ -440,6 +445,46 @@ class CommandResponderBase:
             ):
                 # This will cause MibTree to skip this OID-value
                 raise pysnmp.smi.error.NoAccessError(name=name, idx=idx)
+
+
+class BulkAccessControl:
+    """Compile one VACM snapshot for all bindings in one GETBULK request."""
+
+    def __init__(self, responder, snmpEngine):
+        self._responder = responder
+        self._snmpEngine = snmpEngine
+        self._snapshot = None
+
+    def __call__(self, name, syntax, idx, viewType, acCtx):
+        accessControlModel = self._snmpEngine.accessControlModel[
+            self._responder.acmID
+        ]
+
+        if not hasattr(accessControlModel, "createAccessSnapshot"):
+            self._responder._verifyAccess(name, syntax, idx, viewType, acCtx)
+            return
+
+        def checkAccess(oid):
+            if self._snapshot is None:
+                exec_context = self._snmpEngine.observer.getExecutionContext(
+                    "rfc3412.receiveMessage:request"
+                )
+                self._snapshot = self._snmpEngine.accessControlModel[
+                    self._responder.acmID
+                ].createAccessSnapshot(
+                    self._snmpEngine,
+                    exec_context["securityModel"],
+                    exec_context["securityName"],
+                    exec_context["securityLevel"],
+                    viewType,
+                    exec_context["contextName"],
+                )
+
+            self._snapshot.isAccessAllowed(oid)
+
+        self._responder._verifyAccess(
+            name, syntax, idx, viewType, acCtx, checkAccess
+        )
 
 
 class GetCommandResponder(CommandResponderBase):
@@ -552,6 +597,7 @@ class BulkCommandResponder(CommandResponderBase):
         return fewer repetitions than asked for, which is what makes capping legal.
         """
         (acFun, acCtx) = acInfo
+        acFun = BulkAccessControl(self, snmpEngine)
         nonRepeaters = v2c.apiBulkPDU.getNonRepeaters(PDU)
         nonRepeaters = max(nonRepeaters, 0)
         maxRepetitions = v2c.apiBulkPDU.getMaxRepetitions(PDU)
