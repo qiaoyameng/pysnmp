@@ -10,6 +10,7 @@ Same calls as `pysnmp.hlapi`, awaited rather than blocking.
 
 from pysnmp._aliases import install as _installAliases
 from pysnmp.entity.engine import SnmpEngine
+from pysnmp.hlapi.asyncio._table import MISSING_CELL, TableRow
 from pysnmp.hlapi.asyncio.cmdgen import (
     bulk_cmd,
     bulk_walk_cmd,
@@ -17,6 +18,7 @@ from pysnmp.hlapi.asyncio.cmdgen import (
     is_end_of_mib,
     next_cmd,
     set_cmd,
+    table_walk_cmd,
     walk_cmd,
 )
 from pysnmp.hlapi.asyncio.device import (
@@ -90,6 +92,7 @@ _DEPRECATED_ALIASES = {
     "nextCmd": "next_cmd",
     "sendNotification": "send_notification",
     "setCmd": "set_cmd",
+    "tableWalkCmd": "table_walk_cmd",
     "walkCmd": "walk_cmd",
 }
 

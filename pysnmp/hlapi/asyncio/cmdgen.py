@@ -42,19 +42,31 @@ from pyasn1.type.univ import Null
 from pysnmp._aliases import install as _installAliases
 from pysnmp.entity.rfc3413 import cmdgen
 from pysnmp.hlapi.asyncio._callback import make_callback
+from pysnmp.hlapi.asyncio._table import (
+    MISSING_CELL,
+    TableRow,
+    TableRowAssembler,
+    TooManyPendingRows,
+    findTableRow,
+)
 from pysnmp.hlapi.asyncio._walk import endColumnsThatLeftTheSubtree, walkOptions
 from pysnmp.hlapi.lcd import CommandGeneratorLcdConfigurator
 from pysnmp.hlapi.types import SnmpResponse
 from pysnmp.hlapi.varbinds import CommandGeneratorVarBinds
 from pysnmp.proto import errind
+from pysnmp.smi.error import SmiError
+from pysnmp.smi.rfc1902 import ObjectIdentity, ObjectType
 
 __all__ = [
+    "MISSING_CELL",
+    "TableRow",
     "bulk_cmd",
     "bulk_walk_cmd",
     "get_cmd",
     "is_end_of_mib",
     "next_cmd",
     "set_cmd",
+    "table_walk_cmd",
     "walk_cmd",
 ]
 
@@ -872,6 +884,158 @@ async def bulk_walk_cmd(
         currentVarBinds = varBindTable[-1]
 
 
+async def table_walk_cmd(
+    snmpEngine: Any,
+    authData: Any,
+    transportTarget: Any,
+    contextData: Any,
+    nonRepeaters: int,
+    maxRepetitions: int,
+    *varBinds: Any,
+    **options: Any,
+) -> AsyncGenerator[SnmpResponse, None]:
+    r"""Walk a MIB table with GETBULK, yielding one assembled row at a time.
+
+    :py:func:`bulk_walk_cmd` yields the rows of each GETBULK response as they
+    come: one binding per column, with no promise that the bindings in one
+    row belong to the same table entry -- columns are walked independently
+    and drift apart whenever their instances do not line up. This walks the
+    columns of one MIB table and re-aligns the bindings on the table's
+    INDEX instead: every yield is one entry, its INDEX values decoded per
+    the INDEX clause (composite indexes, variable-length strings and
+    IMPLIED components included), and one cell per column.
+
+    A column that has no cell for an index -- it walked past, left its
+    subtree early, or answered ``endOfMibView`` -- comes out as
+    :py:data:`MISSING_CELL` in that position. Missing cells are never
+    filled from a neighbouring row or column, and a column that ended never
+    holds the others back.
+
+    Parameters
+    ----------
+    snmpEngine : :py:class:`~pysnmp.hlapi.SnmpEngine`
+        Class instance representing SNMP engine.
+
+    authData : :py:class:`~pysnmp.hlapi.CommunityData` or :py:class:`~pysnmp.hlapi.UsmUserData`
+        Class instance representing SNMP credentials.
+
+    transportTarget : :py:class:`~pysnmp.hlapi.asyncio.UdpTransportTarget` or :py:class:`~pysnmp.hlapi.asyncio.Udp6TransportTarget`
+        Class instance representing transport type along with SNMP peer address.
+
+    contextData : :py:class:`~pysnmp.hlapi.ContextData`
+        Class instance representing SNMP ContextEngineId and ContextName values.
+
+    nonRepeaters : int
+        How many of the bindings are fetched once rather than walked.
+
+    maxRepetitions : int
+        How many rows to ask the agent for per request.
+
+    \*varBinds : :py:class:`~pysnmp.smi.rfc1902.ObjectType`
+        A single class instance naming the table to walk, either by its
+        table object (``IF-MIB::ifTable``) or its entry
+        (``IF-MIB::ifEntry``). The MIB must be loaded, since the table's
+        columns and INDEX clause come from it.
+
+    Other Parameters
+    ----------------
+    \*\*options :
+        The same walk options :py:func:`bulk_walk_cmd` takes, plus:
+
+            * `maxPendingRows` - how many rows may wait on a lagging column
+              before the walk fails. Default is `1000`. Rows go pending
+              while some column has not reached their index yet; a column
+              that never delivers would otherwise keep them pending without
+              bound, so crossing the limit yields an error row rather than
+              waiting on a column that is never coming.
+
+    Yields
+    ------
+    errorIndication : str
+        True value indicates SNMP engine error, or that `maxPendingRows`
+        was exceeded.
+    errorStatus : str
+        True value indicates SNMP PDU error.
+    errorIndex : int
+        Non-zero value refers to `varBinds[errorIndex-1]`
+    varBinds : :py:class:`~pysnmp.hlapi.asyncio.TableRow`
+        The assembled row: `indices` holds the decoded INDEX values and
+        `cells` one value per column of the entry, in the order
+        :py:meth:`pysnmp.smi.view.MibViewController.getTableColumns`
+        reports them, with :py:data:`MISSING_CELL` where the walk saw no
+        cell.
+
+    Examples
+    --------
+    >>> from pysnmp.hlapi.asyncio import *
+    >>>
+    >>> async def run():
+    ...     async for (errorIndication, errorStatus, errorIndex,
+    ...                row) in table_walk_cmd(
+    ...         SnmpEngine(),
+    ...         CommunityData('public'),
+    ...         UdpTransportTarget(('demo.pysnmp.com', 161)),
+    ...         ContextData(),
+    ...         0, 25,
+    ...         ObjectType(ObjectIdentity('IF-MIB', 'ifTable')),
+    ...     ):
+    ...         print(errorIndication, row.indices, row.cells)
+    >>>
+    """
+    maxPendingRows = options.pop("maxPendingRows", 1000)
+
+    if len(varBinds) != 1:
+        raise SmiError(
+            f"table_walk_cmd takes exactly one table or entry, got {len(varBinds)}"
+        )
+
+    resolved = vbProcessor.makeVarBinds(snmpEngine, varBinds)
+    rowNode = findTableRow(snmpEngine, tuple(resolved[0][0].getOid()))
+    assembler = TableRowAssembler(rowNode, maxPendingRows)
+
+    columnVarBinds = [
+        ObjectType(ObjectIdentity(colName))
+        for _colId, colName, _colNode in assembler.columns
+    ]
+    if not columnVarBinds:
+        raise SmiError(f"Table at {rowNode.name!r} defines no columns")
+
+    async for (
+        errorIndication,
+        errorStatus,
+        errorIndex,
+        rowVarBinds,
+    ) in bulk_walk_cmd(
+        snmpEngine,
+        authData,
+        transportTarget,
+        contextData,
+        nonRepeaters,
+        maxRepetitions,
+        *columnVarBinds,
+        **options,
+    ):
+        if errorIndication or errorStatus:
+            yield SnmpResponse(errorIndication, errorStatus, errorIndex, ())
+            return
+
+        for varBind in rowVarBinds:
+            name, value = varBind[0], varBind[1]
+            name = name.getOid() if hasattr(name, "getOid") else name
+            try:
+                completedRows = assembler.feed(tuple(name), value)
+            except TooManyPendingRows as exc:
+                yield SnmpResponse(exc, 0, 0, ())
+                return
+            for tableRow in completedRows:
+                yield SnmpResponse(
+                    errorIndication, errorStatus, errorIndex, tableRow
+                )
+
+    for tableRow in assembler.finish():
+        yield SnmpResponse(None, 0, 0, tableRow)
+
+
 #: The camelCase spellings these names used to have. Served by ``__getattr__``
 #: below rather than bound here, so that using one warns -- see
 #: :py:mod:`pysnmp._aliases`.
@@ -882,6 +1046,7 @@ _DEPRECATED_ALIASES = {
     "isEndOfMib": "is_end_of_mib",
     "nextCmd": "next_cmd",
     "setCmd": "set_cmd",
+    "tableWalkCmd": "table_walk_cmd",
     "walkCmd": "walk_cmd",
 }
 

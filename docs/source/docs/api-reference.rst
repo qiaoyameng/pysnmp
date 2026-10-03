@@ -123,6 +123,7 @@ Command Generator
    /docs/hlapi/asyncio/manager/cmdgen/bulkcmd
    /docs/hlapi/asyncio/manager/cmdgen/walkcmd
    /docs/hlapi/asyncio/manager/cmdgen/bulkwalkcmd
+   /docs/hlapi/asyncio/manager/cmdgen/tablewalkcmd
 
 Notification Originator
 
