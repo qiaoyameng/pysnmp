@@ -225,7 +225,7 @@ class CommandResponderBase:
                 stateReference,
                 contextName,
                 PDU,
-                (self.__verifyAccess, snmpEngine),
+                (self._verifyAccess, snmpEngine),
             )
 
         except Exception as exc:  # noqa: BLE001 - a request that answered with nothing leaves the manager to time out, so every failure is mapped to an error status
@@ -362,7 +362,20 @@ class CommandResponderBase:
 
         self.releaseStateInformation(stateReference)
 
-    def __verifyAccess(self, name, syntax, idx, viewType, acCtx):
+    def _accessCredentials(self, snmpEngine):
+        """Security and context parameters shared by every binding in a request."""
+        execCtx = snmpEngine.observer.getExecutionContext(
+            "rfc3412.receiveMessage:request"
+        )
+        return (
+            execCtx["securityModel"],
+            execCtx["securityName"],
+            execCtx["securityLevel"],
+            execCtx["contextName"],
+            execCtx["pdu"].tagSet,
+        )
+
+    def _verifyAccess(self, name, syntax, idx, viewType, acCtx, accessChecker=None):
         """Check one binding against the access control model, as an SMI error.
 
         The credentials come from the observer's record of the message rather than
@@ -371,26 +384,31 @@ class CommandResponderBase:
         the caller may not see is indistinguishable from one that is not there.
         """
         snmpEngine = acCtx
-        execCtx = snmpEngine.observer.getExecutionContext(
-            "rfc3412.receiveMessage:request"
-        )
-        (securityModel, securityName, securityLevel, contextName, pduType) = (
-            execCtx["securityModel"],
-            execCtx["securityName"],
-            execCtx["securityLevel"],
-            execCtx["contextName"],
-            execCtx["pdu"].tagSet,
-        )
+        (
+            securityModel,
+            securityName,
+            securityLevel,
+            contextName,
+            pduType,
+        ) = self._accessCredentials(snmpEngine)
+
+        accessControlModel = snmpEngine.accessControlModel[self.acmID]
+
+        if accessChecker is None:
+
+            def accessChecker(oid):
+                return accessControlModel.isAccessAllowed(
+                    snmpEngine,
+                    securityModel,
+                    securityName,
+                    securityLevel,
+                    viewType,
+                    contextName,
+                    oid,
+                )
+
         try:
-            snmpEngine.accessControlModel[self.acmID].isAccessAllowed(
-                snmpEngine,
-                securityModel,
-                securityName,
-                securityLevel,
-                viewType,
-                contextName,
-                name,
-            )
+            accessChecker(name)
         # Map ACM errors onto SMI ones
         except error.StatusInformation as statusInformation:
             debug.logger & debug.flagApp and debug.logger(
@@ -551,7 +569,7 @@ class BulkCommandResponder(CommandResponderBase):
         work the agent does and how large the response gets. :RFC:`3416` lets an agent
         return fewer repetitions than asked for, which is what makes capping legal.
         """
-        (acFun, acCtx) = acInfo
+        _, acCtx = acInfo
         nonRepeaters = v2c.apiBulkPDU.getNonRepeaters(PDU)
         nonRepeaters = max(nonRepeaters, 0)
         maxRepetitions = v2c.apiBulkPDU.getMaxRepetitions(PDU)
@@ -569,6 +587,58 @@ class BulkCommandResponder(CommandResponderBase):
         debug.logger & debug.flagApp and debug.logger(
             f"handleMgmtOperation: N {N}, M {M}, R {R}"
         )
+
+        (
+            securityModel,
+            securityName,
+            securityLevel,
+            requestContextName,
+            _,
+        ) = self._accessCredentials(snmpEngine)
+        accessControlModel = snmpEngine.accessControlModel[self.acmID]
+        accessSnapshot = None
+        snapshotFactory = getattr(accessControlModel, "createAccessSnapshot", None)
+
+        def checkAccess(name):
+            nonlocal accessSnapshot
+
+            if accessSnapshot is None:
+                if snapshotFactory is None:
+                    accessSnapshot = False
+                else:
+                    accessSnapshot = snapshotFactory(
+                        snmpEngine,
+                        securityModel,
+                        securityName,
+                        securityLevel,
+                        "read",
+                        requestContextName,
+                    )
+
+            if accessSnapshot is False:
+                return accessControlModel.isAccessAllowed(
+                    snmpEngine,
+                    securityModel,
+                    securityName,
+                    securityLevel,
+                    "read",
+                    requestContextName,
+                    name,
+                )
+
+            return accessSnapshot.isAccessAllowed(name)
+
+        def verifyAccess(name, syntax, idx, viewType, requestContext):
+            return self._verifyAccess(
+                name,
+                syntax,
+                idx,
+                viewType,
+                requestContext,
+                accessChecker=checkAccess,
+            )
+
+        acFun = verifyAccess
 
         mgmtFun = self.snmpContext.getMibInstrum(contextName).readNextVars
 
