@@ -12,6 +12,7 @@ from pysnmp._aliases import install as _installAliases
 from pysnmp.entity.engine import SnmpEngine
 from pysnmp.hlapi.asyncio.cmdgen import (
     bulk_cmd,
+    bulk_table_cmd,
     bulk_walk_cmd,
     get_cmd,
     is_end_of_mib,
@@ -37,6 +38,7 @@ from pysnmp.hlapi.asyncio.transport import (
     UdpTransportTarget,
     UnixTransportTarget,
 )
+from pysnmp.hlapi.types import MISSING_CELL
 from pysnmp.hlapi.auth import (
     CommunityData,
     UsmUserData,
@@ -82,6 +84,7 @@ from pysnmp.smi.rfc1902 import NotificationType, ObjectIdentity, ObjectType
 #: :py:mod:`pysnmp._aliases`.
 _DEPRECATED_ALIASES = {
     "bulkCmd": "bulk_cmd",
+    "bulkTableCmd": "bulk_table_cmd",
     "bulkWalkCmd": "bulk_walk_cmd",
     "dhKeyChange": "dh_key_change",
     "getCmd": "get_cmd",

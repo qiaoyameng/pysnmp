@@ -42,14 +42,16 @@ from pyasn1.type.univ import Null
 from pysnmp._aliases import install as _installAliases
 from pysnmp.entity.rfc3413 import cmdgen
 from pysnmp.hlapi.asyncio._callback import make_callback
+from pysnmp.hlapi.asyncio._table import assemble_bulk_table
 from pysnmp.hlapi.asyncio._walk import endColumnsThatLeftTheSubtree, walkOptions
 from pysnmp.hlapi.lcd import CommandGeneratorLcdConfigurator
-from pysnmp.hlapi.types import SnmpResponse
+from pysnmp.hlapi.types import SnmpResponse, SnmpTableResponse
 from pysnmp.hlapi.varbinds import CommandGeneratorVarBinds
 from pysnmp.proto import errind
 
 __all__ = [
     "bulk_cmd",
+    "bulk_table_cmd",
     "bulk_walk_cmd",
     "get_cmd",
     "is_end_of_mib",
@@ -872,11 +874,76 @@ async def bulk_walk_cmd(
         currentVarBinds = varBindTable[-1]
 
 
+async def bulk_table_cmd(
+    snmpEngine: Any,
+    authData: Any,
+    transportTarget: Any,
+    contextData: Any,
+    nonRepeaters: int,
+    maxRepetitions: int,
+    *varBinds: Any,
+    **options: Any,
+) -> AsyncGenerator[SnmpTableResponse, None]:
+    r"""Walk and align a MIB table's columns, yielding one conceptual row.
+
+    Unlike :py:func:`bulk_walk_cmd`, each response binding is treated as an
+    independent column walk. Returned OIDs are decoded against the target
+    table row's ``INDEX`` definition and grouped by that decoded business key.
+    Compound, variable-length, fixed-length and ``IMPLIED`` indices are handled
+    by the MIB definition.
+
+    Parameters
+    ----------
+    varBinds
+        Exactly one table or table-entry object. Readable columns are selected
+        from its MIB definition.
+
+    Other Parameters
+    ----------------
+    maxRows, maxPendingRows
+        Maximum number of decoded rows that may remain buffered while slower
+        columns lag behind. Exceeding it yields an error instead of waiting
+        indefinitely. Defaults to ``0`` (unbounded).
+    maxCalls
+        Maximum number of GETBULK requests. Defaults to ``0`` (unbounded).
+    ignoreNonIncreasingOid
+        Continue when a column fails to make progress rather than ending with
+        an error. Defaults to ``False``.
+
+    Yields
+    ------
+    SnmpTableResponse
+        ``errorIndication``, ``errorStatus``, ``errorIndex``, decoded
+        ``indices``, and column-ordered ``varBinds``. A cell that has not been
+        observed is the independent :data:`~pysnmp.hlapi.types.MISSING_CELL`
+        marker.
+    """
+    if len(varBinds) != 1:
+        raise ValueError("bulk_table_cmd requires exactly one table or entry")
+
+    tableVarBinds = vbProcessor.makeVarBinds(snmpEngine, varBinds)
+
+    async for response in assemble_bulk_table(
+        bulk_cmd=bulk_cmd,
+        vb_processor=vbProcessor,
+        snmp_engine=snmpEngine,
+        auth_data=authData,
+        transport_target=transportTarget,
+        context_data=contextData,
+        non_repeaters=nonRepeaters,
+        max_repetitions=maxRepetitions,
+        table_var_bind=tableVarBinds[0],
+        options=options,
+    ):
+        yield response
+
+
 #: The camelCase spellings these names used to have. Served by ``__getattr__``
 #: below rather than bound here, so that using one warns -- see
 #: :py:mod:`pysnmp._aliases`.
 _DEPRECATED_ALIASES = {
     "bulkCmd": "bulk_cmd",
+    "bulkTableCmd": "bulk_table_cmd",
     "bulkWalkCmd": "bulk_walk_cmd",
     "getCmd": "get_cmd",
     "isEndOfMib": "is_end_of_mib",

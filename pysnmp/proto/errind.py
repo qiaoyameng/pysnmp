@@ -448,3 +448,21 @@ class OidNotIncreasing(ErrorIndication):
 
 
 oidNotIncreasing = OidNotIncreasing("OID not increasing")
+
+
+class TableIndexError(ErrorIndication):
+    """A table cell OID suffix could not be decoded using the row's INDEX."""
+
+    pass
+
+
+class TableNoProgressError(ErrorIndication):
+    """A table walk received a response that moved none of its columns forward."""
+
+    pass
+
+
+class TableRowLimitError(ErrorIndication):
+    """More rows than permitted are waiting for one or more missing columns."""
+
+    pass

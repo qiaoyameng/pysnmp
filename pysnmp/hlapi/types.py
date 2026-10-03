@@ -11,7 +11,33 @@ provide consistent return-type annotations for SNMP command results.
 
 from typing import Any, NamedTuple
 
-__all__ = ["SnmpResponse"]
+__all__ = ["MISSING_CELL", "MissingCell", "SnmpResponse", "SnmpTableResponse"]
+
+
+class MissingCell:
+    """Marker for a table cell that was absent from the agent's response.
+
+    The singleton :data:`MISSING_CELL` is distinct from SNMP exception values
+    such as ``noSuchInstance``. It means no value for this row and column has
+    been observed, so callers must not treat it as a value copied from another
+    row or from a neighbouring column.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "MISSING_CELL"
+
+    def __bool__(self):
+        return False
+
+
+MISSING_CELL = MissingCell()
 
 
 class SnmpResponse(NamedTuple):
@@ -41,4 +67,20 @@ class SnmpResponse(NamedTuple):
     errorIndication: Any
     errorStatus: Any
     errorIndex: Any
+    varBinds: Any
+
+
+class SnmpTableResponse(NamedTuple):
+    """One conceptual MIB table row assembled from independently walked columns.
+
+    ``indices`` contains the typed INDEX values decoded using the row's MIB
+    definition. ``varBinds`` is ordered by the requested columns; a missing cell
+    contains :data:`MISSING_CELL` rather than a value borrowed from another
+    binding.
+    """
+
+    errorIndication: Any
+    errorStatus: Any
+    errorIndex: Any
+    indices: Any
     varBinds: Any
