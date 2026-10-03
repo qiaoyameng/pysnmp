@@ -133,6 +133,10 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
         engine it talks to be tracked, since that is what the time window is checked
         against. It is expired on a timer, so an engine no longer being talked to does
         not be remembered forever.
+
+        `self._clock` is the wall clock used for all timeline bookkeeping. It is
+        injectable so tests can simulate restarts, clock rollbacks, and device
+        reboots without sleeping.
         """
         AbstractSecurityModel.__init__(self)
         self.__securityParametersSpec = UsmSecurityParameters()
@@ -140,6 +144,7 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
         self.__timelineExpQueue = {}
         self.__expirationTimer = 0
         self.__paramsBranchId = -1
+        self._clock = time.time
 
     def __sec2usr(self, snmpEngine, securityName, securityEngineID=None):
         mibBuilder = snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder
@@ -1188,7 +1193,7 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                 securityParameters.getComponentByPosition(1),
                 securityParameters.getComponentByPosition(2),
                 securityParameters.getComponentByPosition(2),
-                int(time.time()),
+                int(self._clock()),
             )
 
             timerResolution = (
@@ -1227,7 +1232,7 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                     latestUpdateTimestamp,
                 ) = self.__timeline[msgAuthoritativeEngineId]
                 # time passed since last talk with this SNMP engine
-                idleTime = int(time.time()) - latestUpdateTimestamp
+                idleTime = int(self._clock()) - latestUpdateTimestamp
                 debug.logger & debug.flagSM and debug.logger(
                     f"processIncomingMsg: read timeline snmpEngineBoots {snmpEngineBoots} snmpEngineTime {snmpEngineTime} for msgAuthoritativeEngineId {msgAuthoritativeEngineId!r}, idle time {idleTime} secs"
                 )
@@ -1272,7 +1277,7 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
                         msgAuthoritativeEngineBoots,
                         msgAuthoritativeEngineTime,
                         msgAuthoritativeEngineTime,
-                        int(time.time()),
+                        int(self._clock()),
                     )
 
                     timerResolution = (
@@ -1412,6 +1417,163 @@ class SnmpUSMSecurityModel(AbstractSecurityModel):
             maxSizeResponseScopedPDU,
             securityStateReference,
         )
+
+    # Version of the exportTimeline/importTimeline snapshot format.
+    timelineExportVersion = 1
+
+    # How old a snapshot may be before importTimeline refuses it and the
+    # application falls back to normal engine discovery.
+    timelineExportMaxAge = 86400
+
+    def exportTimeline(self):
+        """Snapshot the remote engine clocks this USM trusts, for persistence.
+
+        Restarting a collector otherwise means rediscovering the engine boots
+        and time of every SNMPv3 device it manages. The timeline only ever
+        holds state learned from messages that passed authentication, so
+        exporting it exposes nothing an attacker could not already see on the
+        wire: engine IDs, boots and time counters. No keys, passphrases, or
+        user names are included.
+
+        The returned dict is JSON-serializable; persisting it (and reloading it
+        on startup) is the application's responsibility, as is protecting it
+        from tampering. Import is deliberately strict: a snapshot that cannot
+        prove continuity is rejected and normal discovery takes over.
+        """
+        entries = []
+        for engineId, (
+            snmpEngineBoots,
+            snmpEngineTime,
+            latestReceivedEngineTime,
+            latestUpdateTimestamp,
+        ) in self.__timeline.items():
+            entries.append(
+                {
+                    "engineId": engineId.asOctets().hex(),
+                    "boots": int(snmpEngineBoots),
+                    "time": int(snmpEngineTime),
+                    "latestReceivedEngineTime": int(latestReceivedEngineTime),
+                    "updatedAt": int(latestUpdateTimestamp),
+                }
+            )
+        return {
+            "version": self.timelineExportVersion,
+            "savedAt": int(self._clock()),
+            "entries": entries,
+        }
+
+    def importTimeline(self, snmpEngine, snapshot, maxAgeSeconds=None):
+        """Restore remote engine clocks previously saved with exportTimeline.
+
+        The snapshot is validated before anything is trusted: the format and
+        version must match, engine IDs must be well-formed (5-32 octets, and
+        never our own), boots/time counters must fit the RFC 3414 range, and
+        the save time must neither lie in the future (wall clock rollback) nor
+        be older than `maxAgeSeconds`. Entries that fail validation are
+        skipped, so their engines simply go through normal discovery again;
+        nothing here widens the RFC 3414 time window on the receive path.
+
+        Restored entries are only used to estimate a peer's clock when sending.
+        Incoming messages are still authenticated and the boots/time monotonic
+        rules still apply, so a stale or replayed estimate can at worst cost
+        one notInTimeWindow report round trip.
+
+        Returns the number of entries imported. Raises ValueError when the
+        snapshot itself is malformed or too old to prove continuity.
+        """
+        if maxAgeSeconds is None:
+            maxAgeSeconds = self.timelineExportMaxAge
+        if not isinstance(snapshot, dict):
+            raise ValueError("timeline snapshot must be a dict")
+        if snapshot.get("version") != self.timelineExportVersion:
+            raise ValueError(
+                f"unsupported timeline snapshot version {snapshot.get('version')!r}"
+            )
+        savedAt = snapshot.get("savedAt")
+        if not isinstance(savedAt, int) or isinstance(savedAt, bool):
+            raise ValueError("timeline snapshot savedAt must be an int")
+        entries = snapshot.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("timeline snapshot entries must be a list")
+
+        now = int(self._clock())
+        if savedAt > now:
+            raise ValueError(
+                "timeline snapshot saved in the future; wall clock rollback "
+                "makes continuity unprovable, falling back to discovery"
+            )
+        if now - savedAt > maxAgeSeconds:
+            raise ValueError(
+                f"timeline snapshot is {now - savedAt} seconds old "
+                f"(max {maxAgeSeconds}), falling back to discovery"
+            )
+
+        mibBuilder = snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder
+        (snmpEngineID,) = mibBuilder.importSymbols(
+            "__SNMP-FRAMEWORK-MIB", "snmpEngineID"
+        )
+        localEngineIdOctets = snmpEngineID.syntax.asOctets()
+        timerResolution = (
+            snmpEngine.transportDispatcher is None
+            and 1.0
+            or snmpEngine.transportDispatcher.getTimerResolution()
+        )
+
+        imported = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                engineIdOctets = bytes.fromhex(entry["engineId"])
+                boots = entry["boots"]
+                engTime = entry["time"]
+                latestReceived = entry["latestReceivedEngineTime"]
+                updatedAt = entry["updatedAt"]
+            except (KeyError, TypeError, ValueError):
+                continue  # malformed entry: normal discovery for this engine
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in (boots, engTime, latestReceived, updatedAt)
+            ):
+                continue
+            if not 5 <= len(engineIdOctets) <= 32:
+                continue  # not a valid SnmpEngineID
+            if engineIdOctets == localEngineIdOctets:
+                continue  # our own clock is read from the LCD, never imported
+            if not (
+                0 <= boots <= 2147483647
+                and 0 <= engTime <= 2147483647
+                and 0 <= latestReceived <= 2147483647
+            ):
+                continue
+            if not 0 < updatedAt <= savedAt:
+                continue  # entry newer than the snapshot: continuity unprovable
+            if now - updatedAt > maxAgeSeconds:
+                continue  # last authenticated contact too long ago
+
+            engineId = univ.OctetString(engineIdOctets)
+            # Shift the update timestamp into the current clock domain so idle
+            # time accounting continues seamlessly across the restart.
+            adjustedUpdatedAt = updatedAt + (now - savedAt)
+            existing = self.__timeline.get(engineId)
+            if existing is not None and existing[3] >= adjustedUpdatedAt:
+                continue  # never let a snapshot clobber fresher authed state
+            self.__timeline[engineId] = (
+                univ.Integer(boots),
+                univ.Integer(engTime),
+                univ.Integer(latestReceived),
+                adjustedUpdatedAt,
+            )
+            expireAt = int(self.__expirationTimer + 300 / timerResolution)
+            if expireAt not in self.__timelineExpQueue:
+                self.__timelineExpQueue[expireAt] = []
+            self.__timelineExpQueue[expireAt].append(engineId)
+            imported += 1
+
+        debug.logger & debug.flagSM and debug.logger(
+            f"importTimeline: imported {imported} of {len(entries)} timeline entries"
+        )
+        return imported
 
     def __expireTimelineInfo(self):
         if self.__expirationTimer in self.__timelineExpQueue:
