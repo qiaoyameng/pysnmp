@@ -57,6 +57,13 @@ from pysnmp.hlapi.auth import (
     usmNoPrivProtocol,
 )
 from pysnmp.hlapi.context import ContextData
+from pysnmp.hlapi.notification import (
+    NotificationBinding,
+    NotificationObject,
+    NotificationRow,
+    ParsedNotification,
+    parse_notification,
+)
 from pysnmp.proto.rfc1902 import (
     Bits,
     Counter32,
