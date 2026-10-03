@@ -35,6 +35,7 @@ Notification Receiver Applications
 
    /examples/v3arch/asyncio/manager/ntfrcv/transport-tweaks
    /examples/v3arch/asyncio/manager/ntfrcv/forwarding-traps
+   /examples/v3arch/asyncio/manager/ntfrcv/structured-traps
 
 For more details on PySNMP programming model and interfaces, please 
 refer to the documentation
